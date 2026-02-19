@@ -1,21 +1,28 @@
 require("dotenv").config();
 const axios = require("axios");
+const { MongoClient } = require("mongodb");
 
-// -- PARAMETERS YOU NEED TO SET --
-const PICAOS_API_KEY =
-  process.env.PICAOS_API_KEY ||
-  "sk_test_ON1Xslhr7OpMr848mTly5-QL0FyRioWB3CxHRvJx0Gk";
-const PICAOS_CONNECTION_KEY =
-  process.env.PICAOS_CONNECTION_KEY ||
-  "test::outlook-mail::default::da5a297e3f704501bbaa9e772155973a";
-const PICA_ACTION_ID =
-  process.env.PICA_ACTION_ID ||
-  "conn_mod_def::GCoq5BXDv9U::Lo_3KMz1Qkede3-2Gjbdhg";
+function requireEnv(name) {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing required env var: ${name}`);
+  }
+  return value;
+}
+
+// -- PARAMETERS YOU NEED TO SET (via .env) --
+const PICAOS_API_KEY = requireEnv("PICAOS_API_KEY");
+const PICAOS_CONNECTION_KEY = requireEnv("PICAOS_CONNECTION_KEY");
+const PICA_ACTION_ID = requireEnv("PICA_ACTION_ID");
 const PICA_ACTION_ENV = process.env.PICA_ACTION_ENV || "test";
+const PICA_BASE_URL = requireEnv("PICA_BASE_URL");
+
+const MONGODB_URI = requireEnv("MONGODB_URI");
+const MONGODB_DB = requireEnv("MONGODB_DB");
+const MONGODB_COLLECTION = process.env.MONGODB_COLLECTION || "po_mails";
 
 // -- API INFO --
-const baseUrl =
-  "https://api.picaos.com/v1/passthrough/me/mailFolders/Inbox/messages";
+const baseUrl = PICA_BASE_URL;
 
 const headers = {
   "Content-Type": "application/json",
@@ -24,6 +31,16 @@ const headers = {
   "x-pica-action-id": PICA_ACTION_ID,
   "X-Pica-Action-Environment": PICA_ACTION_ENV,
 };
+
+let mongoClient;
+
+async function getCollection() {
+  if (!mongoClient) {
+    mongoClient = new MongoClient(MONGODB_URI);
+    await mongoClient.connect();
+  }
+  return mongoClient.db(MONGODB_DB).collection(MONGODB_COLLECTION);
+}
 
 function toIso(value) {
   return new Date(value).toISOString();
@@ -116,6 +133,47 @@ function htmlToText(htmlContent) {
   return extractPoDetails(text);
 }
 
+function pickStoredFields(item) {
+  return {
+    id: item.id || "",
+    subject: item.subject || "",
+    from: item.from
+      ? {
+          name: item.from.name || "",
+          address: item.from.address || "",
+        }
+      : null,
+    receivedDateTime: item.receivedDateTime || "",
+    bodyPreview: item.bodyPreview || "",
+    extracted: {
+      candidate_name: item.extracted?.candidate_name || "",
+      email: item.extracted?.email || "",
+      phone_number: item.extracted?.phone_number || "",
+      location: item.extracted?.location || "",
+      position_applied: item.extracted?.position_applied || "",
+      job_location: item.extracted?.job_location || "",
+      end_client: item.extracted?.end_client || "",
+      rate: item.extracted?.rate || "",
+      interview_support_by: item.extracted?.interview_support_by || "",
+      team_lead: item.extracted?.team_lead || "",
+      manager: item.extracted?.manager || "",
+    },
+  };
+}
+
+async function upsertPoMails(items) {
+  if (!items.length) return;
+  const collection = await getCollection();
+  const ops = items.map((item) => ({
+    updateOne: {
+      filter: { id: item.id },
+      update: { $set: pickStoredFields(item) },
+      upsert: true,
+    },
+  }));
+  await collection.bulkWrite(ops, { ordered: false });
+}
+
 async function fetchPoMails() {
   let nextUrl = baseUrl;
   let nextParams = { ...params };
@@ -140,7 +198,7 @@ async function fetchPoMails() {
     return aDate - bDate;
   });
 
-  return allEmails.map((email) => ({
+  const mapped = allEmails.map((email) => ({
     id: email.id || "",
     subject: email.subject || "",
     from: email.from?.emailAddress || null,
@@ -149,6 +207,10 @@ async function fetchPoMails() {
     webLink: email.webLink || "",
     extracted: htmlToText(email.body?.content || ""),
   }));
+
+  await upsertPoMails(mapped);
+
+  return mapped;
 }
 
 async function main() {
